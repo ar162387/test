@@ -125,6 +125,19 @@ export const SCRIPT: StageDefinition[] = [
   },
 ];
 
+// Short display labels for STAGE_ORDER, shared between the live call view and the past-calls
+// list so both name a stage the same way.
+export const STAGE_LABELS: Record<Stage, string> = {
+  opening: "Opening",
+  reason_for_call: "Reason for Call",
+  qualifying: "Qualifying Questions",
+  bill_swap: "Bill Swap",
+  decision_makers: "Decision Makers",
+  set_appointment: "Set Appointment",
+  lock_confirm: "Lock & Confirm",
+  recap_close: "Recap & Close",
+};
+
 export function getStageDefinition(stage: Stage): StageDefinition {
   const def = SCRIPT.find((s) => s.stage === stage);
   if (!def) throw new Error(`Unknown stage: ${stage}`);

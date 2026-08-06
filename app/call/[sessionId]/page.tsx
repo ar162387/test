@@ -11,6 +11,7 @@ import {
   wavBase64ToMono,
 } from "@/lib/voice/encodeWav";
 import { createBrowserClient } from "@/lib/supabase/client";
+import { STAGE_LABELS } from "@/lib/script";
 
 interface TranscriptEntry {
   role: "agent" | "homeowner";
@@ -23,17 +24,6 @@ interface TranscriptEntry {
 // "transcribing" and "thinking" are separate so the operator can see which leg is slow instead
 // of staring at one undifferentiated "Thinking…" for the whole chain.
 type Phase = "idle" | "transcribing" | "thinking";
-
-const STAGE_LABELS: Record<string, string> = {
-  opening: "Opening",
-  reason_for_call: "Reason for Call",
-  qualifying: "Qualifying Questions",
-  bill_swap: "Bill Swap",
-  decision_makers: "Decision Makers",
-  set_appointment: "Set Appointment",
-  lock_confirm: "Lock & Confirm",
-  recap_close: "Recap & Close",
-};
 
 // Reads a fetch Response as JSON, but never throws on an empty/non-JSON body (e.g. a
 // serverless timeout or crash returns nothing) — returns a normalized {ok, data, error}.
@@ -446,7 +436,7 @@ export default function CallPage() {
         </div>
         <div className="text-right space-y-1">
           <span className="inline-block px-2 py-1 rounded bg-neutral-800 text-xs">
-            {STAGE_LABELS[stage] || stage}
+            {STAGE_LABELS[stage as keyof typeof STAGE_LABELS] || stage}
           </span>
           <div>
             <span
