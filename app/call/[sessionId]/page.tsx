@@ -564,20 +564,87 @@ export default function CallPage() {
   );
 }
 
+// Leaving `utterance.voice` unset makes the browser fall back to its cheapest local voice —
+// on Windows/Linux Chrome that's the flat, robotic "Microsoft David"-style default that reads
+// everything in the same dead monotone (the "vampire" voice). Every engine also ships at least
+// one considerably more natural voice; picking it explicitly is the whole fix.
+//
+// Preference order, checked as a substring against the voice name:
+//   Google voices (Chrome's network TTS) > OS "Natural"/"Neural" voices (Edge on Windows 11,
+//   newer Safari) > known good OS voices (Samantha/Ava/Zira are the least robotic locally
+//   installed options on Mac/Windows) > any other English voice > engine default.
+const PREFERRED_VOICE_NAMES = [
+  "Google US English",
+  "Google UK English Female",
+  "Natural",
+  "Neural",
+  "Samantha",
+  "Ava",
+  "Zira",
+  "Aria",
+  "Jenny",
+];
+
+let cachedVoice: SpeechSynthesisVoice | null | undefined; // undefined = not resolved yet
+
+function pickVoice(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
+  const english = voices.filter((v) => v.lang?.toLowerCase().startsWith("en"));
+  const pool = english.length ? english : voices;
+  for (const name of PREFERRED_VOICE_NAMES) {
+    const match = pool.find((v) => v.name.includes(name));
+    if (match) return match;
+  }
+  return pool[0] ?? voices[0] ?? null;
+}
+
+// Voice list loads asynchronously and is often empty on the very first call — `voiceschanged`
+// fires once the engine has actually enumerated its voices, so wait for that rather than
+// racing it (a race would silently fall back to the robotic default on a fast page load).
+function getPreferredVoice(): Promise<SpeechSynthesisVoice | null> {
+  if (cachedVoice !== undefined) return Promise.resolve(cachedVoice);
+
+  const synth = window.speechSynthesis;
+  const existing = synth.getVoices();
+  if (existing.length > 0) {
+    cachedVoice = pickVoice(existing);
+    return Promise.resolve(cachedVoice);
+  }
+
+  return new Promise((resolve) => {
+    const onVoices = () => {
+      synth.removeEventListener("voiceschanged", onVoices);
+      cachedVoice = pickVoice(synth.getVoices());
+      resolve(cachedVoice);
+    };
+    synth.addEventListener("voiceschanged", onVoices);
+    // Some engines never fire the event at all — don't hang the call waiting for it.
+    setTimeout(() => {
+      synth.removeEventListener("voiceschanged", onVoices);
+      if (cachedVoice === undefined) cachedVoice = pickVoice(synth.getVoices());
+      resolve(cachedVoice);
+    }, 500);
+  });
+}
+
 // Last-resort voice: the browser's built-in speech synthesis. Free, offline, no quota — so the
 // agent still has a voice even when the TTS API is exhausted. Resolves when speech finishes
 // (or immediately if the browser has no synthesis support) so call pacing is unchanged.
 // `isCurrent` lets a barge-in cut it off instead of talking over the next turn.
-function speakWithBrowser(text: string, isCurrent: () => boolean): Promise<void> {
+async function speakWithBrowser(text: string, isCurrent: () => boolean): Promise<void> {
+  if (typeof window === "undefined" || !window.speechSynthesis || !isCurrent()) return;
+
+  const voice = await getPreferredVoice();
+  if (!isCurrent()) return;
+
   return new Promise((resolve) => {
-    if (typeof window === "undefined" || !window.speechSynthesis || !isCurrent()) {
-      resolve();
-      return;
-    }
     try {
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 1.05; // a touch quicker than default reads more naturally on a call
+      if (voice) utterance.voice = voice;
+      // The flat default pitch is a big part of what reads as robotic/creepy — a hair above
+      // neutral plus a touch more pace lands closer to a real person on a call.
+      utterance.pitch = 1.05;
+      utterance.rate = 1.02;
       utterance.onend = () => resolve();
       utterance.onerror = () => resolve();
       window.speechSynthesis.speak(utterance);
