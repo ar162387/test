@@ -62,136 +62,153 @@ function fallbackTurn(currentStage: Stage): TurnResponse {
 }
 
 export async function POST(req: Request) {
-  const body = await req.json();
-  const { sessionId, audioBase64, mimeType, text: textOverride } = body;
-  if (!sessionId) return NextResponse.json({ error: "sessionId required" }, { status: 400 });
-
-  const supabase = createServiceClient();
-
-  const { data: session, error: sessionErr } = await supabase
-    .from("call_sessions")
-    .select("*")
-    .eq("id", sessionId)
-    .single();
-  if (sessionErr || !session) {
-    return NextResponse.json({ error: sessionErr?.message || "Session not found" }, { status: 404 });
-  }
-
-  const { data: contactRow } = await supabase
-    .from("contacts")
-    .select("first_name, last_name, full_name, phone, address")
-    .eq("id", session.contact_id)
-    .single();
-  const contact = contactRow as Contact;
-
-  // 1. STT (or a text override for the text-only debug/eval loop)
-  let homeownerText: string;
-  if (textOverride) {
-    homeownerText = textOverride;
-  } else if (audioBase64) {
-    homeownerText = await transcribeAudio(audioBase64, mimeType || "audio/webm");
-  } else {
-    return NextResponse.json({ error: "audioBase64 or text required" }, { status: 400 });
-  }
-
-  const { data: priorTurns } = await supabase
-    .from("call_turns")
-    .select("turn_index, objection_key")
-    .eq("session_id", sessionId)
-    .order("turn_index", { ascending: true });
-
-  const nextTurnIndex = (priorTurns?.[priorTurns.length - 1]?.turn_index ?? -1) + 1;
-  const objectionHistory = Array.from(
-    new Set((priorTurns || []).map((t) => t.objection_key).filter(Boolean) as string[])
-  );
-
-  await supabase.from("call_turns").insert({
-    session_id: sessionId,
-    turn_index: nextTurnIndex,
-    role: "homeowner",
-    transcript: homeownerText,
-    stage: session.current_stage,
-  });
-
-  // 2. Kimi reasoning turn, with one corrective retry on schema/guard failure.
-  const currentStage = session.current_stage as Stage;
-  const qualifying = extractQualifying(session as SessionRow);
-
-  async function attemptTurn(correction?: string): Promise<TurnResponse> {
-    const systemPrompt =
-      buildSystemPrompt({
-        contact,
-        currentStage,
-        qualifying,
-        lastHomeownerUtterance: homeownerText,
-        objectionHistory,
-      }) + (correction ? `\n\nIMPORTANT CORRECTION: ${correction}` : "");
-
-    const { toolInput } = await callKimiForTurn(systemPrompt, [
-      { role: "user", text: homeownerText },
-    ]);
-    const parsed = TurnResponseSchema.safeParse(toolInput);
-    if (!parsed.success) throw new Error(`schema: ${parsed.error.message}`);
-
-    const guard = guardTurn(parsed.data, { currentStage });
-    if (!guard.ok) throw new Error(`guard: ${guard.reason}`);
-
-    return parsed.data;
-  }
-
-  let turn: TurnResponse;
-  let latencyStart = Date.now();
+  // Everything below can throw (STT network error, Bedrock error, a bad audio clip, a DB
+  // hiccup) — without this wrapper, an uncaught exception here crashes the whole serverless
+  // function and the client gets a body-less 500 it can't even JSON.parse.
   try {
-    turn = await attemptTurn();
-  } catch (e: any) {
+    const body = await req.json();
+    const { sessionId, audioBase64, mimeType, text: textOverride } = body;
+    if (!sessionId) return NextResponse.json({ error: "sessionId required" }, { status: 400 });
+
+    const supabase = createServiceClient();
+
+    const { data: session, error: sessionErr } = await supabase
+      .from("call_sessions")
+      .select("*")
+      .eq("id", sessionId)
+      .single();
+    if (sessionErr || !session) {
+      return NextResponse.json({ error: sessionErr?.message || "Session not found" }, { status: 404 });
+    }
+
+    const { data: contactRow } = await supabase
+      .from("contacts")
+      .select("first_name, last_name, full_name, phone, address")
+      .eq("id", session.contact_id)
+      .single();
+    const contact = contactRow as Contact;
+
+    // 1. STT (or a text override for the text-only debug/eval loop)
+    let homeownerText: string;
+    if (textOverride) {
+      homeownerText = textOverride;
+    } else if (audioBase64) {
+      try {
+        homeownerText = await transcribeAudio(audioBase64, mimeType || "audio/webm");
+      } catch (e: any) {
+        return NextResponse.json({ error: `Transcription failed: ${e.message}` }, { status: 502 });
+      }
+      if (!homeownerText) {
+        return NextResponse.json(
+          { error: "Couldn't make out any speech in that clip — try again." },
+          { status: 422 }
+        );
+      }
+    } else {
+      return NextResponse.json({ error: "audioBase64 or text required" }, { status: 400 });
+    }
+
+    const { data: priorTurns } = await supabase
+      .from("call_turns")
+      .select("turn_index, objection_key")
+      .eq("session_id", sessionId)
+      .order("turn_index", { ascending: true });
+
+    const nextTurnIndex = (priorTurns?.[priorTurns.length - 1]?.turn_index ?? -1) + 1;
+    const objectionHistory = Array.from(
+      new Set((priorTurns || []).map((t) => t.objection_key).filter(Boolean) as string[])
+    );
+
+    await supabase.from("call_turns").insert({
+      session_id: sessionId,
+      turn_index: nextTurnIndex,
+      role: "homeowner",
+      transcript: homeownerText,
+      stage: session.current_stage,
+    });
+
+    // 2. Kimi reasoning turn, with one corrective retry on schema/guard failure.
+    const currentStage = session.current_stage as Stage;
+    const qualifying = extractQualifying(session as SessionRow);
+
+    async function attemptTurn(correction?: string): Promise<TurnResponse> {
+      const systemPrompt =
+        buildSystemPrompt({
+          contact,
+          currentStage,
+          qualifying,
+          lastHomeownerUtterance: homeownerText,
+          objectionHistory,
+        }) + (correction ? `\n\nIMPORTANT CORRECTION: ${correction}` : "");
+
+      const { toolInput } = await callKimiForTurn(systemPrompt, [
+        { role: "user", text: homeownerText },
+      ]);
+      const parsed = TurnResponseSchema.safeParse(toolInput);
+      if (!parsed.success) throw new Error(`schema: ${parsed.error.message}`);
+
+      const guard = guardTurn(parsed.data, { currentStage });
+      if (!guard.ok) throw new Error(`guard: ${guard.reason}`);
+
+      return parsed.data;
+    }
+
+    let turn: TurnResponse;
+    const latencyStart = Date.now();
     try {
-      turn = await attemptTurn(
-        `Your previous response was rejected (${e.message}). Follow the hard rules exactly this time.`
-      );
-    } catch {
-      turn = fallbackTurn(currentStage);
+      turn = await attemptTurn();
+    } catch (e: any) {
+      try {
+        turn = await attemptTurn(
+          `Your previous response was rejected (${e.message}). Follow the hard rules exactly this time.`
+        );
+      } catch {
+        turn = fallbackTurn(currentStage);
+      }
     }
-  }
-  const latencyMs = Date.now() - latencyStart;
+    const latencyMs = Date.now() - latencyStart;
 
-  // objection_attempt: how many times this exact objection has now been raised this call
-  const objectionAttempt =
-    turn.intent === "objection" && turn.objection_key
-      ? (priorTurns || []).filter((t) => t.objection_key === turn.objection_key).length + 1
-      : undefined;
+    // objection_attempt: how many times this exact objection has now been raised this call
+    const objectionAttempt =
+      turn.intent === "objection" && turn.objection_key
+        ? (priorTurns || []).filter((t) => t.objection_key === turn.objection_key).length + 1
+        : undefined;
 
-  await supabase.from("call_turns").insert({
-    session_id: sessionId,
-    turn_index: nextTurnIndex + 1,
-    role: "agent",
-    transcript: turn.reply,
-    stage: turn.next_stage,
-    intent: turn.intent,
-    objection_key: turn.objection_key || null,
-    objection_attempt: objectionAttempt,
-    latency_ms: latencyMs,
-  });
+    await supabase.from("call_turns").insert({
+      session_id: sessionId,
+      turn_index: nextTurnIndex + 1,
+      role: "agent",
+      transcript: turn.reply,
+      stage: turn.next_stage,
+      intent: turn.intent,
+      objection_key: turn.objection_key || null,
+      objection_attempt: objectionAttempt,
+      latency_ms: latencyMs,
+    });
 
-  const sessionUpdate: Record<string, unknown> = {
-    current_stage: turn.next_stage,
-    status: turn.call_status,
-  };
-  if (turn.dq_reason) sessionUpdate.dq_reason = turn.dq_reason;
-  if (turn.extracted) {
-    for (const [k, v] of Object.entries(turn.extracted)) {
-      if (v !== undefined) sessionUpdate[k] = v;
+    const sessionUpdate: Record<string, unknown> = {
+      current_stage: turn.next_stage,
+      status: turn.call_status,
+    };
+    if (turn.dq_reason) sessionUpdate.dq_reason = turn.dq_reason;
+    if (turn.extracted) {
+      for (const [k, v] of Object.entries(turn.extracted)) {
+        if (v !== undefined) sessionUpdate[k] = v;
+      }
     }
-  }
-  await supabase.from("call_sessions").update(sessionUpdate).eq("id", sessionId);
+    await supabase.from("call_sessions").update(sessionUpdate).eq("id", sessionId);
 
-  return NextResponse.json({
-    reply: turn.reply,
-    stage: turn.next_stage,
-    intent: turn.intent,
-    objectionKey: turn.objection_key,
-    callStatus: turn.call_status,
-    dqReason: turn.dq_reason,
-    extracted: turn.extracted,
-    homeownerText,
-  });
+    return NextResponse.json({
+      reply: turn.reply,
+      stage: turn.next_stage,
+      intent: turn.intent,
+      objectionKey: turn.objection_key,
+      callStatus: turn.call_status,
+      dqReason: turn.dq_reason,
+      extracted: turn.extracted,
+      homeownerText,
+    });
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || "Unexpected server error" }, { status: 500 });
+  }
 }
