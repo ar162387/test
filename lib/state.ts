@@ -75,11 +75,22 @@ export function guardTurn(turn: TurnResponse, ctx: GuardContext): GuardResult {
   // isDqCandidate. Blocking those outright would mean a renter could never be disqualified,
   // since "I rent" is itself an objection-sheet entry.
   if (turn.intent === "objection") {
+    const objection = turn.objection_key ? getObjection(turn.objection_key) : undefined;
     if (turn.call_status === "disqualified" && !isDqCandidateKey(turn.objection_key)) {
       return { ok: false, reason: "Objection turns may not disqualify the call" };
     }
     if (turn.next_stage === "recap_close" && ctx.currentStage !== "recap_close") {
       return { ok: false, reason: "Objection turns may not jump to recap_close" };
+    }
+    if (
+      objection?.category === "late" &&
+      turn.call_status !== "disqualified" &&
+      !/does that sound fair\??/i.test(turn.reply)
+    ) {
+      return {
+        ok: false,
+        reason: 'Late objection replies must complete the framework with "Does that sound fair?"',
+      };
     }
   }
 

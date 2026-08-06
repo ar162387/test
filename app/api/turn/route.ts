@@ -57,6 +57,49 @@ function extractQualifying(session: SessionRow): QualifyingData {
   return out;
 }
 
+// The model may only write a qualifying field when the latest homeowner utterance contains
+// direct evidence for it. Previously a roof-leak objection incorrectly produced "no shading".
+// Existing session values are also removed from the delta so old facts are not re-extracted.
+function sanitizeExtracted(
+  turn: TurnResponse,
+  existing: QualifyingData,
+  homeownerText: string
+): TurnResponse {
+  if (!turn.extracted) return turn;
+
+  const evidence: Partial<Record<keyof QualifyingData, RegExp>> = {
+    avg_monthly_bill: /\b(?:bill|pay|paying|month|monthly|dollars?|\$)\b/i,
+    home_type: /\b(?:single[- ]family|condo|townhome|house|home type)\b/i,
+    electricity_provider: /\b(?:provider|utility|electric company|power company)\b/i,
+    appointment_type: /\b(?:in[- ]home|virtual|video|come (?:by|over|out))\b/i,
+    homeowner_confirmed: /\b(?:own|owner|homeowner|my house|my home)\b/i,
+    decision_makers: /\b(?:decision|spouse|wife|husband|partner|co-owner)\b/i,
+    roof_condition_type: /\b(?:roof|shingle|tile|flat roof)\b/i,
+    shading_issues: /\b(?:shade|shading|tree|sunlight|block(?:ed|ing)?)\b/i,
+    credit_score_above_650: /\b(?:credit|score|650)\b/i,
+    taxable_income_above_45k: /\b(?:income|taxable|45[,.]?000|45k)\b/i,
+    already_has_solar: /\b(?:already have solar|have panels|solar installed)\b/i,
+    language: /\b(?:language|speak|english|spanish)\b/i,
+    decision_makers_reminded: /\b(?:decision maker|spouse|partner|present|be there)\b/i,
+    utility_bill_reminded: /\b(?:utility bill|electric bill|copy of.*bill)\b/i,
+    confirmation_call_reminded: /\b(?:confirmation|call before|text confirmation)\b/i,
+    email: /@|\bemail\b/i,
+    appointment_at: /\b(?:appointment|today|tomorrow|morning|afternoon|evening|am|pm)\b/i,
+    consultant_name: /\b(?:consultant|engineer)\b/i,
+    extra_notes: /\b(?:note|remember|important)\b/i,
+  };
+
+  const cleaned: QualifyingData = {};
+  for (const [key, value] of Object.entries(turn.extracted) as Array<
+    [keyof QualifyingData, QualifyingData[keyof QualifyingData]]
+  >) {
+    if (existing[key] !== undefined) continue;
+    if (evidence[key]?.test(homeownerText)) (cleaned as any)[key] = value;
+  }
+
+  return { ...turn, extracted: Object.keys(cleaned).length > 0 ? cleaned : undefined };
+}
+
 /**
  * Bedrock is stateless: saving turns in Postgres does not make them available to the next
  * request. Kimi's forced-tool path is unreliable when reconstructed assistant text is supplied
@@ -177,10 +220,11 @@ export async function POST(req: Request) {
       const parsed = TurnResponseSchema.safeParse(toolInput);
       if (!parsed.success) throw new Error(`schema: ${parsed.error.message}`);
 
-      const guard = guardTurn(parsed.data, { currentStage });
+      const sanitized = sanitizeExtracted(parsed.data, qualifying, homeownerText);
+      const guard = guardTurn(sanitized, { currentStage });
       if (!guard.ok) throw new Error(`guard: ${guard.reason}`);
 
-      return parsed.data;
+      return sanitized;
     }
 
     let turn: TurnResponse;
