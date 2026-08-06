@@ -1,8 +1,11 @@
-// Text-to-speech leg via Gemini's native TTS (gemini-2.5-flash-preview-tts).
-// Behind a narrow interface so swapping providers (e.g. Deepgram Aura-2) later is a one-file change.
+// Text-to-speech leg via Gemini's native TTS.
+// Behind a narrow interface so swapping providers later is a one-file change.
 
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = process.env.GEMINI_TTS_MODEL || "gemini-2.5-flash-preview-tts";
+// gemini-2.5-flash-preview-tts has a free-tier cap of 10 requests/DAY, which a single test
+// call burns through — the symptom is replies arriving with text but no audio.
+// gemini-3.1-flash-tts-preview draws on a separate, far more generous pool.
+const MODEL = process.env.GEMINI_TTS_MODEL || "gemini-3.1-flash-tts-preview";
 const VOICE = process.env.GEMINI_TTS_VOICE || "Kore";
 
 export interface TTSResult {
@@ -10,10 +13,13 @@ export interface TTSResult {
   mimeType: "audio/wav";
 }
 
-// gemini-2.5-flash-preview-tts is a preview model that intermittently returns
-// "Model tried to generate text, but it should only be used for TTS" (HTTP 400) on an
-// otherwise-identical request — confirmed by replaying the exact same body back-to-back.
-// A short retry absorbs this rather than surfacing a broken turn to the caller.
+export class TTSQuotaError extends Error {
+  readonly quota = true;
+}
+
+// Preview TTS models intermittently return "Model tried to generate text, but it should only be
+// used for TTS" (400) on an otherwise-identical request. A short retry absorbs that.
+// Quota errors (429) are NEVER retried — retrying burns the remaining allowance 3x faster.
 const MAX_ATTEMPTS = 3;
 
 export async function synthesizeSpeech(text: string): Promise<TTSResult> {
@@ -25,6 +31,7 @@ export async function synthesizeSpeech(text: string): Promise<TTSResult> {
       return await synthesizeOnce(text);
     } catch (e: any) {
       lastError = e;
+      if (e instanceof TTSQuotaError) throw e; // fail fast, don't burn quota
       if (attempt < MAX_ATTEMPTS) {
         await new Promise((r) => setTimeout(r, 200 * attempt));
       }
@@ -51,6 +58,9 @@ async function synthesizeOnce(text: string): Promise<TTSResult> {
 
   if (!res.ok) {
     const errText = await res.text();
+    if (res.status === 429) {
+      throw new TTSQuotaError(`Gemini TTS quota exceeded for ${MODEL}`);
+    }
     throw new Error(`Gemini TTS failed: ${res.status} ${errText}`);
   }
 

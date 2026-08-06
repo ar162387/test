@@ -35,6 +35,19 @@ export class CallRecorder {
     return this.micStream;
   }
 
+  // Browsers start an AudioContext suspended unless it was created during a user gesture.
+  // Because TTS playback is routed through this context, a suspended context means the agent
+  // is inaudible — so resume it before every playback.
+  async ensureRunning() {
+    if (this.ctx.state === "suspended") {
+      try {
+        await this.ctx.resume();
+      } catch {
+        // Nothing more we can do here; the caller falls back to browser speech synthesis.
+      }
+    }
+  }
+
   async stop(): Promise<Blob> {
     return new Promise((resolve) => {
       if (!this.recorder) {

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { CallRecorder } from "@/lib/voice/callRecorder";
+import { blobToWavBase64 } from "@/lib/voice/encodeWav";
 import { createBrowserClient } from "@/lib/supabase/client";
 
 interface TranscriptEntry {
@@ -116,7 +117,11 @@ export default function CallPage() {
       });
       const { ok, data } = await readJson(res);
       if (!ok) {
+        // Server TTS unavailable (most often a Gemini quota 429). Speak with the browser voice
+        // rather than showing a silent line.
         revealOnce();
+        if (data?.quota) setTurnError("Gemini TTS quota reached — using the browser voice.");
+        await speakWithBrowser(text);
         return;
       }
 
@@ -124,13 +129,21 @@ export default function CallPage() {
       recorderRef.current?.routePlaybackElement(audioEl);
       audioEl.addEventListener("playing", revealOnce, { once: true });
 
+      // Playback is routed through the recorder's AudioContext so the call recording captures
+      // the agent's side. If that context is suspended (browser autoplay policy) the audio is
+      // silently swallowed, so make sure it's running first.
+      await recorderRef.current?.ensureRunning();
+
       await audioEl.play();
       await new Promise((resolve) => {
         audioEl.onended = resolve;
         audioEl.onerror = resolve;
       });
     } catch {
-      // Autoplay blocked, decode error, network failure — show the text regardless.
+      // Real TTS unavailable (quota, autoplay block, decode error) — fall back to the browser's
+      // built-in voice so the call is never silently mute. Lower quality, but always available.
+      revealOnce();
+      await speakWithBrowser(text);
     } finally {
       revealOnce();
     }
@@ -157,8 +170,14 @@ export default function CallPage() {
     mr.onstop = async () => {
       const blob = new Blob(turnChunksRef.current, { type: "audio/webm" });
       if (blob.size < 500) return; // too short to be real speech
-      const base64 = await blobToBase64(blob);
-      await handleTurn(base64, "audio/webm");
+      try {
+        // Convert to WAV — Gemini doesn't officially accept webm, and feeding it webm
+        // produced badly wrong transcripts.
+        const wavBase64 = await blobToWavBase64(blob);
+        await handleTurn(wavBase64, "audio/wav");
+      } catch {
+        setTurnError("Couldn't process that recording — please try again.");
+      }
     };
     mr.stop();
   }
@@ -312,6 +331,30 @@ export default function CallPage() {
       </div>
     </div>
   );
+}
+
+// Last-resort voice: the browser's built-in speech synthesis. Free, offline, no quota — so the
+// agent always has a voice even when the TTS API is exhausted. Resolves when speech finishes
+// (or immediately if the browser has no synthesis support) so call pacing is unchanged.
+function speakWithBrowser(text: string): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof window === "undefined" || !window.speechSynthesis) {
+      resolve();
+      return;
+    }
+    try {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.05; // a touch quicker than default reads more naturally on a call
+      utterance.onend = () => resolve();
+      utterance.onerror = () => resolve();
+      window.speechSynthesis.speak(utterance);
+      // Safety net: some browsers never fire onend for long strings.
+      setTimeout(resolve, Math.min(30000, 400 + text.length * 70));
+    } catch {
+      resolve();
+    }
+  });
 }
 
 function blobToBase64(blob: Blob): Promise<string> {
