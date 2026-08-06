@@ -39,8 +39,12 @@ const TURN_TOOL_JSON_SCHEMA = {
         decision_makers: { type: "array", items: { type: "string" } },
         roof_condition_type: { type: "string" },
         shading_issues: { type: "string" },
-        credit_score_above_650: { type: "string", enum: ["true", "false", "unsure"] },
-        taxable_income_above_45k: { type: "string", enum: ["true", "false", "unsure"] },
+        credit_score_above_650: {
+          oneOf: [{ type: "boolean" }, { type: "string", enum: ["unsure"] }],
+        },
+        taxable_income_above_45k: {
+          oneOf: [{ type: "boolean" }, { type: "string", enum: ["unsure"] }],
+        },
         already_has_solar: { type: "boolean" },
         language: { type: "string" },
         decision_makers_reminded: { type: "boolean" },

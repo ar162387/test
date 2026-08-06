@@ -59,54 +59,33 @@ function extractQualifying(session: SessionRow): QualifyingData {
 
 /**
  * Bedrock is stateless: saving turns in Postgres does not make them available to the next
- * Converse request. Rebuild the conversation on every request so the model can see what it
- * has already said. A synthetic first user message keeps the history valid for models that
- * require a conversation to begin with `user`, since real calls begin with our agent opening.
+ * request. Kimi's forced-tool path is unreliable when reconstructed assistant text is supplied
+ * as native Converse assistant messages, so pass one authoritative, role-labelled transcript.
+ * The model still receives every line, while the provider sees the same proven single-user
+ * request shape on every turn.
  */
 function buildConversationHistory(
   priorTurns: PersistedTurn[],
   homeownerText: string
 ): BedrockMessage[] {
-  const messages: BedrockMessage[] = [];
+  const transcript = priorTurns
+    .map((turn) => `${turn.role === "agent" ? "AGENT" : "HOMEOWNER"}: ${turn.transcript}`)
+    .join("\n");
 
-  const append = (message: BedrockMessage) => {
-    const previous = messages[messages.length - 1];
-    if (previous?.role === message.role) {
-      // Normally turns alternate. Merging makes old/partially persisted sessions safe to
-      // resume because Converse rejects adjacent messages with the same role on some models.
-      previous.text = `${previous.text}\n\n${message.text}`;
-    } else {
-      messages.push(message);
-    }
-  };
-
-  if (priorTurns[0]?.role === "agent") {
-    append({
+  return [
+    {
       role: "user",
-      text: "[The phone call connected. Start the sales conversation now.]",
-    });
-  }
+      text: `This is the authoritative transcript of the live call so far. Continue from it; do not restart or repeat a line the agent already said.
 
-  for (const turn of priorTurns) {
-    append({
-      role: turn.role === "agent" ? "assistant" : "user",
-      text: turn.transcript,
-    });
-  }
+<conversation_so_far>
+${transcript || "(The call has just connected.)"}
+</conversation_so_far>
 
-  append({ role: "user", text: homeownerText });
-  return messages;
-}
-
-// One retry with an explicit correction note if the model violates schema or guardrails —
-// falls back to a safe, in-character holding line rather than ever surfacing a broken turn.
-function fallbackTurn(currentStage: Stage): TurnResponse {
-  return {
-    intent: "script_answer",
-    reply: "Sorry, could you say that one more time for me?",
-    next_stage: currentStage,
-    call_status: "in_progress",
-  };
+<latest_homeowner_reply>
+${homeownerText}
+</latest_homeowner_reply>`,
+    },
+  ];
 }
 
 export async function POST(req: Request) {
@@ -178,17 +157,6 @@ export async function POST(req: Request) {
       return acc;
     }, {});
 
-    const { error: homeownerInsertError } = await supabase.from("call_turns").insert({
-      session_id: sessionId,
-      turn_index: nextTurnIndex,
-      role: "homeowner",
-      transcript: homeownerText,
-      stage: session.current_stage,
-    });
-    if (homeownerInsertError) {
-      return NextResponse.json({ error: homeownerInsertError.message }, { status: 500 });
-    }
-
     // 2. Kimi reasoning turn, with one corrective retry on schema/guard failure.
     const currentStage = session.current_stage as Stage;
     const qualifying = extractQualifying(session as SessionRow);
@@ -219,16 +187,39 @@ export async function POST(req: Request) {
     const latencyStart = Date.now();
     try {
       turn = await attemptTurn();
-    } catch (e: any) {
+    } catch (firstError: any) {
       try {
         turn = await attemptTurn(
-          `Your previous response was rejected (${e.message}). Follow the hard rules exactly this time.`
+          `Your previous response was rejected (${firstError.message}). Follow the hard rules exactly this time.`
         );
-      } catch {
-        turn = fallbackTurn(currentStage);
+      } catch (secondError: any) {
+        // Never turn an infrastructure/schema failure into fake dialogue. That was the source
+        // of the repeated "say that again" response and made a healthy transcription look lost.
+        console.error("Turn generation failed twice", {
+          sessionId,
+          firstError: firstError?.message,
+          secondError: secondError?.message,
+        });
+        return NextResponse.json(
+          { error: "The agent couldn't generate a valid reply. Please retry this turn." },
+          { status: 502 }
+        );
       }
     }
     const latencyMs = Date.now() - latencyStart;
+
+    // Only persist the homeowner line after generation succeeds. A failed model request should
+    // not leave a dangling user turn that gets duplicated when the operator retries.
+    const { error: homeownerInsertError } = await supabase.from("call_turns").insert({
+      session_id: sessionId,
+      turn_index: nextTurnIndex,
+      role: "homeowner",
+      transcript: homeownerText,
+      stage: session.current_stage,
+    });
+    if (homeownerInsertError) {
+      return NextResponse.json({ error: homeownerInsertError.message }, { status: 500 });
+    }
 
     // objection_attempt: how many times this exact objection has now been raised this call
     const objectionAttempt =
