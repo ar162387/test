@@ -52,15 +52,27 @@ export function buildSystemPrompt(inputs: PromptInputs): string {
   const unfilled = QUALIFYING_FIELD_ORDER.filter((f) => qualifying[f] === undefined);
   const candidates = lastHomeownerUtterance ? retrieveObjections(lastHomeownerUtterance, 4) : [];
 
+  // For an objection raised for the FIRST time, hand over the sheet's verbatim wording.
+  // For a repeat, deliberately withhold it: leaving the script text in the prompt while telling
+  // the model not to reuse it loses every time — a concrete line beats an abstract instruction,
+  // and the agent just replays the same opener. Removing it is what actually forces a new angle.
+  const renderObjection = (o: (typeof candidates)[number]) => {
+    const timesRaised = objectionCounts[o.key] || 0;
+    if (timesRaised > 0) {
+      const alreadySaid =
+        o.category === "early" ? `${o.agree} ${o.resume}` : o.response.slice(0, 160);
+      return `[${o.key}] "${o.trigger}" — ALREADY RAISED ${timesRaised}x THIS CALL.
+  You have ALREADY said: "${alreadySaid}"
+  Do NOT say that again, not even a paraphrase of its opening. Open differently and take a new angle this time.`;
+    }
+    return o.category === "early"
+      ? `[${o.key}] "${o.trigger}"\n  AGREE: ${o.agree}\n  RESUME: ${o.resume}`
+      : `[${o.key}] "${o.trigger}"\n  RESPONSE: ${o.response}`;
+  };
+
   const objectionBlock =
     candidates.length > 0
-      ? candidates
-          .map((o) =>
-            o.category === "early"
-              ? `[${o.key}] "${o.trigger}"\n  AGREE: ${o.agree}\n  RESUME: ${o.resume}`
-              : `[${o.key}] "${o.trigger}"\n  RESPONSE: ${o.response}`
-          )
-          .join("\n\n")
+      ? candidates.map(renderObjection).join("\n\n")
       : "(none matched this utterance — if the homeowner is not raising a real objection, treat this as a normal script_answer turn)";
 
   return `You are ${agentName}, a solar appointment setter making a live phone call. You are talking to ${contact.full_name} at ${contact.address} (phone ${contact.phone}).
