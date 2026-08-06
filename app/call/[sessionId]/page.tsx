@@ -60,6 +60,9 @@ export default function CallPage() {
   const turnRecorderRef = useRef<MediaRecorder | null>(null);
   const turnChunksRef = useRef<Blob[]>([]);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+  // State updates are asynchronous. This ref closes the small window where a second pointer
+  // event could start/submit another turn before `busy` has re-rendered the button disabled.
+  const turnInFlightRef = useRef(false);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -86,11 +89,21 @@ export default function CallPage() {
         return;
       }
 
+      const savedTranscript: TranscriptEntry[] = (data.turns || []).map((t: any) => ({
+        role: t.role,
+        text: t.transcript,
+        stage: t.stage,
+        intent: t.intent,
+        objectionKey: t.objection_key,
+      }));
       const openingTurn = (data.turns || []).find((t: any) => t.turn_index === 0);
-      if (openingTurn) {
+      if (openingTurn && savedTranscript.length === 1) {
         await playText(openingTurn.transcript, () =>
-          setTranscript([{ role: "agent", text: openingTurn.transcript, stage: "opening" }])
+          setTranscript(savedTranscript)
         );
+      } else {
+        // A resumed/refreshed call should restore every turn without replaying the greeting.
+        setTranscript(savedTranscript);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -151,7 +164,7 @@ export default function CallPage() {
 
   function startTurnRecording() {
     const micStream = recorderRef.current?.getMicStream();
-    if (!micStream || busy || callStatus !== "in_progress") return;
+    if (!micStream || busy || turnInFlightRef.current || callStatus !== "in_progress") return;
     setTurnError(null);
     turnChunksRef.current = [];
     const mr = new MediaRecorder(micStream, { mimeType: "audio/webm" });
@@ -165,7 +178,9 @@ export default function CallPage() {
 
   function stopTurnRecording() {
     const mr = turnRecorderRef.current;
-    if (!mr) return;
+    if (!mr || mr.state === "inactive") return;
+    // Clear before calling stop: touch devices can emit a follow-up mouseup for the same press.
+    turnRecorderRef.current = null;
     setRecording(false);
     mr.onstop = async () => {
       const blob = new Blob(turnChunksRef.current, { type: "audio/webm" });
@@ -183,6 +198,8 @@ export default function CallPage() {
   }
 
   async function handleTurn(audioBase64: string, mimeType: string) {
+    if (turnInFlightRef.current) return;
+    turnInFlightRef.current = true;
     setBusy(true);
     setTurnError(null);
     try {
@@ -207,6 +224,7 @@ export default function CallPage() {
     } catch (e: any) {
       setTurnError(e.message || "That turn failed — you can try again.");
     } finally {
+      turnInFlightRef.current = false;
       setBusy(false);
     }
   }

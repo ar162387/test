@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createServiceClient } from "@/lib/supabase/server";
 import { transcribeAudio } from "@/lib/voice/stt";
-import { callKimiForTurn } from "@/lib/bedrock";
+import { callKimiForTurn, type BedrockMessage } from "@/lib/bedrock";
 import { buildSystemPrompt, Contact } from "@/lib/prompt";
 import { TurnResponseSchema, guardTurn, TurnResponse } from "@/lib/state";
 import { Stage, QualifyingData } from "@/lib/script";
@@ -17,6 +17,13 @@ interface SessionRow {
   current_stage: Stage;
   status: string;
   [key: string]: unknown; // qualifying-sheet columns live flat on this row
+}
+
+interface PersistedTurn {
+  turn_index: number;
+  role: "agent" | "homeowner";
+  transcript: string;
+  objection_key: string | null;
 }
 
 const QUALIFYING_KEYS: (keyof QualifyingData)[] = [
@@ -50,6 +57,47 @@ function extractQualifying(session: SessionRow): QualifyingData {
   return out;
 }
 
+/**
+ * Bedrock is stateless: saving turns in Postgres does not make them available to the next
+ * Converse request. Rebuild the conversation on every request so the model can see what it
+ * has already said. A synthetic first user message keeps the history valid for models that
+ * require a conversation to begin with `user`, since real calls begin with our agent opening.
+ */
+function buildConversationHistory(
+  priorTurns: PersistedTurn[],
+  homeownerText: string
+): BedrockMessage[] {
+  const messages: BedrockMessage[] = [];
+
+  const append = (message: BedrockMessage) => {
+    const previous = messages[messages.length - 1];
+    if (previous?.role === message.role) {
+      // Normally turns alternate. Merging makes old/partially persisted sessions safe to
+      // resume because Converse rejects adjacent messages with the same role on some models.
+      previous.text = `${previous.text}\n\n${message.text}`;
+    } else {
+      messages.push(message);
+    }
+  };
+
+  if (priorTurns[0]?.role === "agent") {
+    append({
+      role: "user",
+      text: "[The phone call connected. Start the sales conversation now.]",
+    });
+  }
+
+  for (const turn of priorTurns) {
+    append({
+      role: turn.role === "agent" ? "assistant" : "user",
+      text: turn.transcript,
+    });
+  }
+
+  append({ role: "user", text: homeownerText });
+  return messages;
+}
+
 // One retry with an explicit correction note if the model violates schema or guardrails —
 // falls back to a safe, in-character holding line rather than ever surfacing a broken turn.
 function fallbackTurn(currentStage: Stage): TurnResponse {
@@ -80,6 +128,9 @@ export async function POST(req: Request) {
     if (sessionErr || !session) {
       return NextResponse.json({ error: sessionErr?.message || "Session not found" }, { status: 404 });
     }
+    if (session.status !== "in_progress") {
+      return NextResponse.json({ error: "This call has already ended" }, { status: 409 });
+    }
 
     const { data: contactRow } = await supabase
       .from("contacts")
@@ -108,11 +159,16 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "audioBase64 or text required" }, { status: 400 });
     }
 
-    const { data: priorTurns } = await supabase
+    const { data: priorTurnsData, error: priorTurnsError } = await supabase
       .from("call_turns")
-      .select("turn_index, objection_key")
+      .select("turn_index, role, transcript, objection_key")
       .eq("session_id", sessionId)
       .order("turn_index", { ascending: true });
+    if (priorTurnsError) {
+      return NextResponse.json({ error: priorTurnsError.message }, { status: 500 });
+    }
+
+    const priorTurns = (priorTurnsData || []) as PersistedTurn[];
 
     const nextTurnIndex = (priorTurns?.[priorTurns.length - 1]?.turn_index ?? -1) + 1;
     const priorKeys = (priorTurns || []).map((t) => t.objection_key).filter(Boolean) as string[];
@@ -122,13 +178,16 @@ export async function POST(req: Request) {
       return acc;
     }, {});
 
-    await supabase.from("call_turns").insert({
+    const { error: homeownerInsertError } = await supabase.from("call_turns").insert({
       session_id: sessionId,
       turn_index: nextTurnIndex,
       role: "homeowner",
       transcript: homeownerText,
       stage: session.current_stage,
     });
+    if (homeownerInsertError) {
+      return NextResponse.json({ error: homeownerInsertError.message }, { status: 500 });
+    }
 
     // 2. Kimi reasoning turn, with one corrective retry on schema/guard failure.
     const currentStage = session.current_stage as Stage;
@@ -145,9 +204,8 @@ export async function POST(req: Request) {
           objectionCounts,
         }) + (correction ? `\n\nIMPORTANT CORRECTION: ${correction}` : "");
 
-      const { toolInput } = await callKimiForTurn(systemPrompt, [
-        { role: "user", text: homeownerText },
-      ]);
+      const conversation = buildConversationHistory(priorTurns, homeownerText);
+      const { toolInput } = await callKimiForTurn(systemPrompt, conversation);
       const parsed = TurnResponseSchema.safeParse(toolInput);
       if (!parsed.success) throw new Error(`schema: ${parsed.error.message}`);
 
@@ -178,7 +236,7 @@ export async function POST(req: Request) {
         ? (priorTurns || []).filter((t) => t.objection_key === turn.objection_key).length + 1
         : undefined;
 
-    await supabase.from("call_turns").insert({
+    const { error: agentInsertError } = await supabase.from("call_turns").insert({
       session_id: sessionId,
       turn_index: nextTurnIndex + 1,
       role: "agent",
@@ -189,6 +247,9 @@ export async function POST(req: Request) {
       objection_attempt: objectionAttempt,
       latency_ms: latencyMs,
     });
+    if (agentInsertError) {
+      return NextResponse.json({ error: agentInsertError.message }, { status: 500 });
+    }
 
     const sessionUpdate: Record<string, unknown> = {
       current_stage: turn.next_stage,
@@ -200,7 +261,13 @@ export async function POST(req: Request) {
         if (v !== undefined) sessionUpdate[k] = v;
       }
     }
-    await supabase.from("call_sessions").update(sessionUpdate).eq("id", sessionId);
+    const { error: sessionUpdateError } = await supabase
+      .from("call_sessions")
+      .update(sessionUpdate)
+      .eq("id", sessionId);
+    if (sessionUpdateError) {
+      return NextResponse.json({ error: sessionUpdateError.message }, { status: 500 });
+    }
 
     return NextResponse.json({
       reply: turn.reply,
