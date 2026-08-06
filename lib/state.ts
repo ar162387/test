@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { Stage, STAGE_ORDER, isLegalTransition, DqReason } from "./script";
+import { getObjection } from "./objections";
 
 export const TurnIntent = z.enum(["script_answer", "objection", "out_of_scope", "dq_signal"]);
 export type TurnIntent = z.infer<typeof TurnIntent>;
@@ -69,9 +70,12 @@ export function guardTurn(turn: TurnResponse, ctx: GuardContext): GuardResult {
     return { ok: false, reason: "intent=objection but no objection_key provided" };
   }
 
-  // 3. Never give up on an objection: an objection turn can never disqualify or jump to close.
+  // 3. Never give up on an objection — with one carve-out. Some sheet entries ARE the
+  // disqualifier (renter, bill under $60, moving within 6 months); those are marked
+  // isDqCandidate. Blocking those outright would mean a renter could never be disqualified,
+  // since "I rent" is itself an objection-sheet entry.
   if (turn.intent === "objection") {
-    if (turn.call_status === "disqualified") {
+    if (turn.call_status === "disqualified" && !isDqCandidateKey(turn.objection_key)) {
       return { ok: false, reason: "Objection turns may not disqualify the call" };
     }
     if (turn.next_stage === "recap_close" && ctx.currentStage !== "recap_close") {
@@ -92,10 +96,11 @@ export function guardTurn(turn: TurnResponse, ctx: GuardContext): GuardResult {
     }
   }
 
-  // DQ can only be declared through an explicit dq_signal intent, with a real reason attached —
-  // never as a side effect of an objection or a script turn giving up.
+  // DQ must come from an explicit dq_signal, or from one of the objection-sheet entries that
+  // is itself a disqualifier — never as a side effect of a plain script turn giving up.
   if (turn.call_status === "disqualified") {
-    if (turn.intent !== "dq_signal") {
+    const viaDqObjection = turn.intent === "objection" && isDqCandidateKey(turn.objection_key);
+    if (turn.intent !== "dq_signal" && !viaDqObjection) {
       return { ok: false, reason: "call_status=disqualified requires intent=dq_signal" };
     }
     if (!turn.dq_reason) {
@@ -104,6 +109,12 @@ export function guardTurn(turn: TurnResponse, ctx: GuardContext): GuardResult {
   }
 
   return { ok: true };
+}
+
+function isDqCandidateKey(key?: string): boolean {
+  if (!key) return false;
+  const objection = getObjection(key);
+  return !!objection && objection.category === "late" && objection.isDqCandidate === true;
 }
 
 export const DQ_REASONS: DqReason[] = [

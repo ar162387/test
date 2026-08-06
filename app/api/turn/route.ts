@@ -115,9 +115,12 @@ export async function POST(req: Request) {
       .order("turn_index", { ascending: true });
 
     const nextTurnIndex = (priorTurns?.[priorTurns.length - 1]?.turn_index ?? -1) + 1;
-    const objectionHistory = Array.from(
-      new Set((priorTurns || []).map((t) => t.objection_key).filter(Boolean) as string[])
-    );
+    const priorKeys = (priorTurns || []).map((t) => t.objection_key).filter(Boolean) as string[];
+    const objectionHistory = Array.from(new Set(priorKeys));
+    const objectionCounts = priorKeys.reduce<Record<string, number>>((acc, k) => {
+      acc[k] = (acc[k] || 0) + 1;
+      return acc;
+    }, {});
 
     await supabase.from("call_turns").insert({
       session_id: sessionId,
@@ -139,6 +142,7 @@ export async function POST(req: Request) {
           qualifying,
           lastHomeownerUtterance: homeownerText,
           objectionHistory,
+          objectionCounts,
         }) + (correction ? `\n\nIMPORTANT CORRECTION: ${correction}` : "");
 
       const { toolInput } = await callKimiForTurn(systemPrompt, [
