@@ -80,7 +80,7 @@ ${
     ? objectionHistory
         .map((k) => `${k} (raised ${objectionCounts[k] || 1}x)`)
         .join(", ") +
-      `\nIf the homeowner repeats an objection you already answered, do NOT repeat your previous wording. Acknowledge that you already touched on it, then come at it from a genuinely different angle — a different benefit, a question back to them, or a concrete example.`
+      `\nThe homeowner is REPEATING an objection you already answered. Do NOT open with the same scripted line again — saying "Totally understand, sir. And just to clarify..." twice in a row is the single most robotic thing you can do. The verbatim sheet wording is for the FIRST time an objection comes up only. On a repeat: skip the scripted opener entirely, briefly acknowledge you already raised it ("I hear you—", "Fair enough,"), then take a genuinely different angle: a specific benefit you haven't mentioned, a question back to them, or a concrete example. Every repeat must sound like a different sentence from the last one.`
     : "(none yet)"
 }
 
