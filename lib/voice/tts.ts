@@ -10,9 +10,30 @@ export interface TTSResult {
   mimeType: "audio/wav";
 }
 
+// gemini-2.5-flash-preview-tts is a preview model that intermittently returns
+// "Model tried to generate text, but it should only be used for TTS" (HTTP 400) on an
+// otherwise-identical request — confirmed by replaying the exact same body back-to-back.
+// A short retry absorbs this rather than surfacing a broken turn to the caller.
+const MAX_ATTEMPTS = 3;
+
 export async function synthesizeSpeech(text: string): Promise<TTSResult> {
   if (!API_KEY) throw new Error("GEMINI_API_KEY is not set");
 
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await synthesizeOnce(text);
+    } catch (e: any) {
+      lastError = e;
+      if (attempt < MAX_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, 200 * attempt));
+      }
+    }
+  }
+  throw lastError ?? new Error("Gemini TTS failed after retries");
+}
+
+async function synthesizeOnce(text: string): Promise<TTSResult> {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`,
     {

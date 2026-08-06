@@ -7,6 +7,9 @@ import { TurnResponseSchema, guardTurn, TurnResponse } from "@/lib/state";
 import { Stage, QualifyingData } from "@/lib/script";
 
 export const runtime = "nodejs";
+// STT + Kimi (with a possible corrective retry) + several DB round trips can add up —
+// give this route real headroom instead of hitting Vercel's default function timeout.
+export const maxDuration = 60;
 
 interface SessionRow {
   id: string;

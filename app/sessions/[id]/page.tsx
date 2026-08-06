@@ -25,6 +25,7 @@ const FIELD_LABELS: Record<string, string> = {
 export default function SessionReplay() {
   const { id } = useParams<{ id: string }>();
   const [data, setData] = useState<any>(null);
+  const [showTranscript, setShowTranscript] = useState(false);
 
   useEffect(() => {
     fetch(`/api/session/${id}`)
@@ -58,12 +59,22 @@ export default function SessionReplay() {
         </span>
       </div>
 
-      {recordingUrl && (
-        <div>
-          <div className="text-sm text-neutral-400 mb-1">Recording</div>
-          <audio controls src={recordingUrl} className="w-full" />
-        </div>
-      )}
+      {/* Recording is the primary artifact on this page — always visible, not tucked away. */}
+      <div className="border border-neutral-800 rounded-lg p-4">
+        <div className="text-sm font-medium mb-2">Recording</div>
+        {recordingUrl ? (
+          <audio controls src={recordingUrl} className="w-full" preload="metadata" />
+        ) : session.status === "in_progress" ? (
+          <div className="text-sm text-neutral-500">
+            Call still in progress — the recording finalizes once the call ends.
+          </div>
+        ) : (
+          <div className="text-sm text-neutral-500">
+            No recording was saved for this call (mic may have been unavailable, or the upload
+            didn't complete).
+          </div>
+        )}
+      </div>
 
       {filledFields.length > 0 && (
         <div className="border border-neutral-800 rounded-lg p-4 space-y-1">
@@ -78,24 +89,31 @@ export default function SessionReplay() {
       )}
 
       <div>
-        <div className="text-sm font-medium mb-2">Transcript</div>
-        <div className="border border-neutral-800 rounded-lg p-4 space-y-3">
-          {turns.map((t: any) => (
-            <div key={t.id} className={t.role === "agent" ? "text-left" : "text-right"}>
-              <div
-                className={`inline-block max-w-[85%] rounded-lg px-3 py-2 text-sm ${
-                  t.role === "agent" ? "bg-neutral-800" : "bg-blue-900"
-                }`}
-              >
-                {t.transcript}
+        <button
+          onClick={() => setShowTranscript((v) => !v)}
+          className="text-sm font-medium text-neutral-400 hover:text-neutral-100 flex items-center gap-1"
+        >
+          <span>{showTranscript ? "▾" : "▸"}</span> Transcript ({turns.length} turns)
+        </button>
+        {showTranscript && (
+          <div className="border border-neutral-800 rounded-lg p-4 space-y-3 mt-2">
+            {turns.map((t: any) => (
+              <div key={t.id} className={t.role === "agent" ? "text-left" : "text-right"}>
+                <div
+                  className={`inline-block max-w-[85%] rounded-lg px-3 py-2 text-sm ${
+                    t.role === "agent" ? "bg-neutral-800" : "bg-blue-900"
+                  }`}
+                >
+                  {t.transcript}
+                </div>
+                <div className="text-[10px] text-neutral-500 mt-0.5">
+                  {t.stage}
+                  {t.objection_key ? ` · ${t.objection_key} (attempt ${t.objection_attempt})` : ""}
+                </div>
               </div>
-              <div className="text-[10px] text-neutral-500 mt-0.5">
-                {t.stage}
-                {t.objection_key ? ` · ${t.objection_key} (attempt ${t.objection_attempt})` : ""}
-              </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

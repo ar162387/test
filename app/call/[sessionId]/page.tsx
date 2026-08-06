@@ -24,6 +24,21 @@ const STAGE_LABELS: Record<string, string> = {
   recap_close: "Recap & Close",
 };
 
+// Reads a fetch Response as JSON, but never throws on an empty/non-JSON body (e.g. a
+// serverless timeout or crash returns nothing) — returns a normalized {ok, data, error}.
+async function readJson(res: Response): Promise<{ ok: boolean; data: any; error?: string }> {
+  const raw = await res.text();
+  if (!raw) {
+    return { ok: false, data: null, error: `Empty response (HTTP ${res.status})` };
+  }
+  try {
+    const data = JSON.parse(raw);
+    return { ok: res.ok, data, error: res.ok ? undefined : data.error || `HTTP ${res.status}` };
+  } catch {
+    return { ok: false, data: null, error: `Non-JSON response (HTTP ${res.status})` };
+  }
+}
+
 export default function CallPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const router = useRouter();
@@ -35,7 +50,10 @@ export default function CallPage() {
   const [busy, setBusy] = useState(false);
   const [recording, setRecording] = useState(false);
   const [ending, setEnding] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // loadError blocks the whole page (session missing / mic denied) — nothing recoverable.
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // turnError is a dismissible banner for a single failed turn — the call stays usable.
+  const [turnError, setTurnError] = useState<string | null>(null);
 
   const recorderRef = useRef<CallRecorder | null>(null);
   const turnRecorderRef = useRef<MediaRecorder | null>(null);
@@ -49,56 +67,66 @@ export default function CallPage() {
   useEffect(() => {
     (async () => {
       const res = await fetch(`/api/session/${sessionId}`);
-      const json = await res.json();
-      if (!res.ok) {
-        setError(json.error || "Failed to load session");
+      const { ok, data, error } = await readJson(res);
+      if (!ok) {
+        setLoadError(error || "Failed to load session");
         return;
       }
-      setContact(json.contact);
-      setStage(json.session.current_stage);
-      setCallStatus(json.session.status);
+      setContact(data.contact);
+      setStage(data.session.current_stage);
+      setCallStatus(data.session.status);
 
       const rec = new CallRecorder();
       recorderRef.current = rec;
       try {
         await rec.start();
       } catch {
-        setError("Microphone access is required to run this call.");
+        setLoadError("Microphone access is required to run this call.");
         return;
       }
 
-      const openingTurn = (json.turns || []).find((t: any) => t.turn_index === 0);
+      const openingTurn = (data.turns || []).find((t: any) => t.turn_index === 0);
       if (openingTurn) {
-        setTranscript([{ role: "agent", text: openingTurn.transcript, stage: "opening" }]);
-        await playText(openingTurn.transcript);
+        await playText(openingTurn.transcript, () =>
+          setTranscript([{ role: "agent", text: openingTurn.transcript, stage: "opening" }])
+        );
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
-  async function playText(text: string) {
+  // Fetches TTS audio and plays it. `onReady` fires right as playback starts (or immediately
+  // on failure) so the caller can reveal the matching transcript bubble in sync with the voice
+  // instead of showing text long before the audio catches up.
+  async function playText(text: string, onReady: () => void) {
     try {
       const res = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
       });
-      const json = await res.json();
-      if (!res.ok) return;
-      const audioEl = new Audio(`data:${json.mimeType};base64,${json.audioBase64}`);
+      const { ok, data } = await readJson(res);
+      if (!ok) {
+        onReady();
+        return;
+      }
+      const audioEl = new Audio(`data:${data.mimeType};base64,${data.audioBase64}`);
       recorderRef.current?.routePlaybackElement(audioEl);
+      onReady();
       await audioEl.play();
       await new Promise((resolve) => {
         audioEl.onended = resolve;
       });
     } catch {
-      // Non-fatal — transcript still shows the line even if audio playback failed.
+      // Audio failed entirely — still reveal the text so the transcript isn't missing a line.
+      onReady();
     }
   }
 
   function startTurnRecording() {
     const micStream = recorderRef.current?.getMicStream();
     if (!micStream || busy || callStatus !== "in_progress") return;
+    setTurnError(null);
     turnChunksRef.current = [];
     const mr = new MediaRecorder(micStream, { mimeType: "audio/webm" });
     mr.ondataavailable = (e) => {
@@ -124,26 +152,28 @@ export default function CallPage() {
 
   async function handleTurn(audioBase64: string, mimeType: string) {
     setBusy(true);
+    setTurnError(null);
     try {
       const res = await fetch("/api/turn", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionId, audioBase64, mimeType }),
       });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "Turn failed");
+      const { ok, data, error } = await readJson(res);
+      if (!ok) throw new Error(error || "Turn failed");
 
-      setTranscript((t) => [
-        ...t,
-        { role: "homeowner", text: json.homeownerText || "(inaudible)" },
-        { role: "agent", text: json.reply, stage: json.stage, intent: json.intent, objectionKey: json.objectionKey },
-      ]);
-      setStage(json.stage);
-      setCallStatus(json.callStatus);
+      setTranscript((t) => [...t, { role: "homeowner", text: data.homeownerText || "(inaudible)" }]);
+      setStage(data.stage);
+      setCallStatus(data.callStatus);
 
-      await playText(json.reply);
+      await playText(data.reply, () =>
+        setTranscript((t) => [
+          ...t,
+          { role: "agent", text: data.reply, stage: data.stage, intent: data.intent, objectionKey: data.objectionKey },
+        ])
+      );
     } catch (e: any) {
-      setError(e.message);
+      setTurnError(e.message || "That turn failed — you can try again.");
     } finally {
       setBusy(false);
     }
@@ -159,10 +189,10 @@ export default function CallPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ sessionId }),
         });
-        const signJson = await signRes.json();
-        if (signRes.ok) {
+        const { ok, data } = await readJson(signRes);
+        if (ok) {
           const supabase = createBrowserClient();
-          await supabase.storage.from("call-recordings").uploadToSignedUrl(signJson.path, signJson.token, blob);
+          await supabase.storage.from("call-recordings").uploadToSignedUrl(data.path, data.token, blob);
         }
       }
       await fetch("/api/session/end", {
@@ -175,8 +205,18 @@ export default function CallPage() {
     }
   }
 
-  if (error) {
-    return <div className="text-red-400">{error}</div>;
+  if (loadError) {
+    return (
+      <div className="space-y-4">
+        <div className="text-red-400">{loadError}</div>
+        <button
+          onClick={() => router.push("/")}
+          className="px-4 py-2 rounded-md border border-neutral-700 hover:bg-neutral-900 text-sm"
+        >
+          Back to dashboard
+        </button>
+      </div>
+    );
   }
 
   const ended = callStatus !== "in_progress";
@@ -208,6 +248,15 @@ export default function CallPage() {
         </div>
       </div>
 
+      {turnError && (
+        <div className="flex items-center justify-between rounded-md border border-red-900 bg-red-950/50 px-3 py-2 text-sm text-red-300">
+          <span>{turnError}</span>
+          <button onClick={() => setTurnError(null)} className="text-red-400 hover:text-red-200 ml-3">
+            ✕
+          </button>
+        </div>
+      )}
+
       <div className="border border-neutral-800 rounded-lg h-96 overflow-y-auto p-4 space-y-3">
         {transcript.map((t, i) => (
           <div key={i} className={t.role === "agent" ? "text-left" : "text-right"}>
@@ -223,6 +272,7 @@ export default function CallPage() {
             )}
           </div>
         ))}
+        {busy && <div className="text-xs text-neutral-500">Thinking…</div>}
         <div ref={transcriptEndRef} />
       </div>
 

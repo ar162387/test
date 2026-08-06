@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { synthesizeSpeech } from "@/lib/voice/tts";
 
 export const runtime = "nodejs";
+// synthesizeSpeech retries up to 3x on Gemini's intermittent TTS failure — give it headroom.
+export const maxDuration = 60;
 
 export async function POST(req: Request) {
   const { text } = await req.json();
