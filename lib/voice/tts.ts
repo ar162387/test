@@ -2,11 +2,22 @@
 // Behind a narrow interface so swapping providers later is a one-file change.
 
 const API_KEY = process.env.GEMINI_API_KEY;
-// gemini-2.5-flash-preview-tts has a free-tier cap of 10 requests/DAY, which a single test
-// call burns through — the symptom is replies arriving with text but no audio.
-// gemini-3.1-flash-tts-preview draws on a separate, far more generous pool.
-const MODEL = process.env.GEMINI_TTS_MODEL || "gemini-3.1-flash-tts-preview";
 const VOICE = process.env.GEMINI_TTS_VOICE || "Kore";
+
+// Each Gemini TTS model has its own free-tier allowance, and they are small:
+// gemini-2.5-flash-preview-tts caps at TEN requests/day. Rather than depend on one model (or
+// on a correctly-configured GEMINI_TTS_MODEL env var — a stale value there silently pins us to
+// an exhausted model), try them in order and move on whenever one reports quota exhaustion.
+const MODEL_CHAIN = Array.from(
+  new Set(
+    [
+      process.env.GEMINI_TTS_MODEL,
+      "gemini-3.1-flash-tts-preview",
+      "gemini-2.5-pro-preview-tts",
+      "gemini-2.5-flash-preview-tts",
+    ].filter(Boolean) as string[]
+  )
+);
 
 export interface TTSResult {
   wavBase64: string;
@@ -25,24 +36,37 @@ const MAX_ATTEMPTS = 3;
 export async function synthesizeSpeech(text: string): Promise<TTSResult> {
   if (!API_KEY) throw new Error("GEMINI_API_KEY is not set");
 
+  let quotaExhausted = 0;
   let lastError: Error | null = null;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      return await synthesizeOnce(text);
-    } catch (e: any) {
-      lastError = e;
-      if (e instanceof TTSQuotaError) throw e; // fail fast, don't burn quota
-      if (attempt < MAX_ATTEMPTS) {
-        await new Promise((r) => setTimeout(r, 200 * attempt));
+
+  for (const model of MODEL_CHAIN) {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        return await synthesizeOnce(text, model);
+      } catch (e: any) {
+        lastError = e;
+        if (e instanceof TTSQuotaError) {
+          quotaExhausted++;
+          break; // this model is spent — don't retry it, move to the next
+        }
+        if (attempt < MAX_ATTEMPTS) {
+          await new Promise((r) => setTimeout(r, 200 * attempt));
+        }
       }
     }
   }
-  throw lastError ?? new Error("Gemini TTS failed after retries");
+
+  // Every model out of quota is a distinct condition from a transport failure: the client
+  // reacts to it by switching to browser speech synthesis instead of surfacing an error.
+  if (quotaExhausted === MODEL_CHAIN.length) {
+    throw new TTSQuotaError("All Gemini TTS models are out of free-tier quota");
+  }
+  throw lastError ?? new Error("Gemini TTS failed");
 }
 
-async function synthesizeOnce(text: string): Promise<TTSResult> {
+async function synthesizeOnce(text: string, model: string): Promise<TTSResult> {
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -59,7 +83,7 @@ async function synthesizeOnce(text: string): Promise<TTSResult> {
   if (!res.ok) {
     const errText = await res.text();
     if (res.status === 429) {
-      throw new TTSQuotaError(`Gemini TTS quota exceeded for ${MODEL}`);
+      throw new TTSQuotaError(`Gemini TTS quota exceeded for ${model}`);
     }
     throw new Error(`Gemini TTS failed: ${res.status} ${errText}`);
   }
