@@ -29,7 +29,7 @@ export default function SessionsList() {
           >
             <div className="min-w-0 flex-1">
               <div className="font-medium text-sm">{s.contact_name}</div>
-              <div className="text-neutral-500 text-xs">{new Date(s.started_at).toLocaleString()}</div>
+              <div className="text-neutral-500 text-xs">{new Date(s.started_at).toLocaleDateString()}</div>
               {s.status === "in_progress" && <StageProgress stage={s.current_stage} />}
             </div>
             <span
