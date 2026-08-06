@@ -6,6 +6,21 @@ const API_KEY = process.env.GEMINI_API_KEY;
 // API keys ("gemini-2.5-flash is no longer available to new users"), which silently breaks STT.
 const MODEL = process.env.GEMINI_STT_MODEL || "gemini-flash-latest";
 
+/**
+ * Raised when Gemini refuses the request for allowance reasons rather than transport reasons:
+ * 429 RESOURCE_EXHAUSTED (per-minute / per-day rate limit) or 403 PERMISSION_DENIED (key
+ * disabled, billing off, quota project blocked). Both mean "no more audio will be transcribed
+ * for a while", which the UI answers by telling the operator to type instead of retrying.
+ */
+export class STTRateLimitError extends Error {
+  readonly rateLimited = true;
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 export async function transcribeAudio(audioBase64: string, mimeType: string): Promise<string> {
   if (!API_KEY) throw new Error("GEMINI_API_KEY is not set");
 
@@ -32,6 +47,9 @@ export async function transcribeAudio(audioBase64: string, mimeType: string): Pr
 
   if (!res.ok) {
     const errText = await res.text();
+    if (res.status === 429 || res.status === 403) {
+      throw new STTRateLimitError(`Gemini STT rejected the request (${res.status})`, res.status);
+    }
     throw new Error(`Gemini STT failed: ${res.status} ${errText}`);
   }
 

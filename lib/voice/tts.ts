@@ -24,8 +24,16 @@ export interface TTSResult {
   mimeType: "audio/wav";
 }
 
+// 429 RESOURCE_EXHAUSTED (allowance spent) and 403 PERMISSION_DENIED (key disabled / billing
+// off) are both terminal for the rest of the session — retrying either just wastes time. The
+// client answers both by muting server TTS and telling the operator to read the written reply.
 export class TTSQuotaError extends Error {
   readonly quota = true;
+  readonly status: number;
+  constructor(message: string, status = 429) {
+    super(message);
+    this.status = status;
+  }
 }
 
 // Preview TTS models intermittently return "Model tried to generate text, but it should only be
@@ -37,6 +45,7 @@ export async function synthesizeSpeech(text: string): Promise<TTSResult> {
   if (!API_KEY) throw new Error("GEMINI_API_KEY is not set");
 
   let quotaExhausted = 0;
+  let quotaStatus = 429;
   let lastError: Error | null = null;
 
   for (const model of MODEL_CHAIN) {
@@ -47,6 +56,7 @@ export async function synthesizeSpeech(text: string): Promise<TTSResult> {
         lastError = e;
         if (e instanceof TTSQuotaError) {
           quotaExhausted++;
+          quotaStatus = e.status;
           break; // this model is spent — don't retry it, move to the next
         }
         if (attempt < MAX_ATTEMPTS) {
@@ -59,7 +69,10 @@ export async function synthesizeSpeech(text: string): Promise<TTSResult> {
   // Every model out of quota is a distinct condition from a transport failure: the client
   // reacts to it by switching to browser speech synthesis instead of surfacing an error.
   if (quotaExhausted === MODEL_CHAIN.length) {
-    throw new TTSQuotaError("All Gemini TTS models are out of free-tier quota");
+    throw new TTSQuotaError(
+      `All Gemini TTS models are unavailable (${quotaStatus})`,
+      quotaStatus
+    );
   }
   throw lastError ?? new Error("Gemini TTS failed");
 }
@@ -82,8 +95,11 @@ async function synthesizeOnce(text: string, model: string): Promise<TTSResult> {
 
   if (!res.ok) {
     const errText = await res.text();
-    if (res.status === 429) {
-      throw new TTSQuotaError(`Gemini TTS quota exceeded for ${model}`);
+    if (res.status === 429 || res.status === 403) {
+      throw new TTSQuotaError(
+        `Gemini TTS refused ${model} with ${res.status}`,
+        res.status
+      );
     }
     throw new Error(`Gemini TTS failed: ${res.status} ${errText}`);
   }

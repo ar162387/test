@@ -29,11 +29,16 @@ npm run dev
   independent of whatever the model says it did.
 - `lib/voice/{stt,tts}.ts` — Gemini as the voice legs, kept behind a narrow interface so
   swapping providers later is a one-file change.
-- `app/api/turn/route.ts` — the per-turn pipeline: STT → Kimi → schema validation → guard →
-  persist → respond.
+- `lib/voice/callTape.ts` — the call recording, stitched from the push-to-talk clips and the
+  synthesized replies instead of captured live, so the review copy holds the conversation
+  without the waiting between turns.
+- `app/api/stt/route.ts` — transcription on its own round trip, so the browser can render the
+  homeowner's line the instant it exists instead of waiting on the model.
+- `app/api/turn/route.ts` — the per-turn pipeline: Kimi → schema validation → guard → persist →
+  respond. (It still accepts inline audio for scripted/eval callers that have no UI.)
 
 ## Known v1 scope trims
 
-- **Push-to-talk, not full VAD/barge-in.** Hands-free turn-taking with real interruption
-  (`@ricky0123/vad-web` or similar) is a natural next step but adds real complexity; push-to-talk
-  is far more reliable to ship correctly first.
+- **Push-to-talk, not full VAD.** Holding the mic does cut the agent off mid-sentence, but
+  hands-free turn-taking (`@ricky0123/vad-web` or similar) is still a natural next step;
+  push-to-talk is far more reliable to ship correctly first.

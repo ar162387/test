@@ -63,7 +63,13 @@ export default function SessionReplay() {
       <div className="border border-neutral-800 rounded-lg p-4">
         <div className="text-sm font-medium mb-2">Recording</div>
         {recordingUrl ? (
-          <audio controls src={recordingUrl} className="w-full" preload="metadata" />
+          <>
+            <audio controls src={recordingUrl} className="w-full" preload="metadata" />
+            <div className="text-xs text-neutral-500 mt-2">
+              Speech only — the waiting between turns is edited out, so this runs shorter than
+              the call did.
+            </div>
+          </>
         ) : session.status === "in_progress" ? (
           <div className="text-sm text-neutral-500">
             Call still in progress — the recording finalizes once the call ends.

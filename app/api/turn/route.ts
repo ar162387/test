@@ -7,8 +7,8 @@ import { TurnResponseSchema, guardTurn, TurnResponse } from "@/lib/state";
 import { Stage, QualifyingData } from "@/lib/script";
 
 export const runtime = "nodejs";
-// STT + Kimi (with a possible corrective retry) + several DB round trips can add up —
-// give this route real headroom instead of hitting Vercel's default function timeout.
+// Kimi (with a possible corrective retry) plus several DB round trips can add up — give this
+// route real headroom instead of hitting Vercel's default function timeout.
 export const maxDuration = 60;
 
 interface SessionRow {
@@ -154,17 +154,34 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "This call has already ended" }, { status: 409 });
     }
 
-    const { data: contactRow } = await supabase
-      .from("contacts")
-      .select("first_name, last_name, full_name, phone, address")
-      .eq("id", session.contact_id)
-      .single();
+    // The contact row and the prior turns are independent lookups — issuing them together saves
+    // a full Supabase round trip on the critical path of every single turn.
+    const [{ data: contactRow }, { data: priorTurnsData, error: priorTurnsError }] =
+      await Promise.all([
+        supabase
+          .from("contacts")
+          .select("first_name, last_name, full_name, phone, address")
+          .eq("id", session.contact_id)
+          .single(),
+        supabase
+          .from("call_turns")
+          .select("turn_index, role, transcript, objection_key")
+          .eq("session_id", sessionId)
+          .order("turn_index", { ascending: true }),
+      ]);
     const contact = contactRow as Contact;
+    if (priorTurnsError) {
+      return NextResponse.json({ error: priorTurnsError.message }, { status: 500 });
+    }
 
-    // 1. STT (or a text override for the text-only debug/eval loop)
+    const priorTurns = (priorTurnsData || []) as PersistedTurn[];
+
+    // 1. The homeowner's words. The browser normally transcribes via /api/stt first and posts
+    // the text here, so the transcript can render while this request is still in flight; the
+    // inline audio path stays for scripted/eval callers that have no UI to render into.
     let homeownerText: string;
-    if (textOverride) {
-      homeownerText = textOverride;
+    if (typeof textOverride === "string" && textOverride.trim()) {
+      homeownerText = textOverride.trim();
     } else if (audioBase64) {
       try {
         homeownerText = await transcribeAudio(audioBase64, mimeType || "audio/webm");
@@ -180,17 +197,6 @@ export async function POST(req: Request) {
     } else {
       return NextResponse.json({ error: "audioBase64 or text required" }, { status: 400 });
     }
-
-    const { data: priorTurnsData, error: priorTurnsError } = await supabase
-      .from("call_turns")
-      .select("turn_index, role, transcript, objection_key")
-      .eq("session_id", sessionId)
-      .order("turn_index", { ascending: true });
-    if (priorTurnsError) {
-      return NextResponse.json({ error: priorTurnsError.message }, { status: 500 });
-    }
-
-    const priorTurns = (priorTurnsData || []) as PersistedTurn[];
 
     const nextTurnIndex = (priorTurns?.[priorTurns.length - 1]?.turn_index ?? -1) + 1;
     const priorKeys = (priorTurns || []).map((t) => t.objection_key).filter(Boolean) as string[];
@@ -252,39 +258,11 @@ export async function POST(req: Request) {
     }
     const latencyMs = Date.now() - latencyStart;
 
-    // Only persist the homeowner line after generation succeeds. A failed model request should
-    // not leave a dangling user turn that gets duplicated when the operator retries.
-    const { error: homeownerInsertError } = await supabase.from("call_turns").insert({
-      session_id: sessionId,
-      turn_index: nextTurnIndex,
-      role: "homeowner",
-      transcript: homeownerText,
-      stage: session.current_stage,
-    });
-    if (homeownerInsertError) {
-      return NextResponse.json({ error: homeownerInsertError.message }, { status: 500 });
-    }
-
     // objection_attempt: how many times this exact objection has now been raised this call
     const objectionAttempt =
       turn.intent === "objection" && turn.objection_key
         ? (priorTurns || []).filter((t) => t.objection_key === turn.objection_key).length + 1
         : undefined;
-
-    const { error: agentInsertError } = await supabase.from("call_turns").insert({
-      session_id: sessionId,
-      turn_index: nextTurnIndex + 1,
-      role: "agent",
-      transcript: turn.reply,
-      stage: turn.next_stage,
-      intent: turn.intent,
-      objection_key: turn.objection_key || null,
-      objection_attempt: objectionAttempt,
-      latency_ms: latencyMs,
-    });
-    if (agentInsertError) {
-      return NextResponse.json({ error: agentInsertError.message }, { status: 500 });
-    }
 
     const sessionUpdate: Record<string, unknown> = {
       current_stage: turn.next_stage,
@@ -296,10 +274,37 @@ export async function POST(req: Request) {
         if (v !== undefined) sessionUpdate[k] = v;
       }
     }
-    const { error: sessionUpdateError } = await supabase
-      .from("call_sessions")
-      .update(sessionUpdate)
-      .eq("id", sessionId);
+
+    // Persistence only happens once generation has succeeded — a failed model request must not
+    // leave a dangling homeowner turn that gets duplicated when the operator retries.
+    // Both lines go in as one insert, and the session update runs alongside it: three serial
+    // round trips became one, which is dead time removed from before the reply reaches the ear.
+    const [{ error: turnsInsertError }, { error: sessionUpdateError }] = await Promise.all([
+      supabase.from("call_turns").insert([
+        {
+          session_id: sessionId,
+          turn_index: nextTurnIndex,
+          role: "homeowner",
+          transcript: homeownerText,
+          stage: session.current_stage,
+        },
+        {
+          session_id: sessionId,
+          turn_index: nextTurnIndex + 1,
+          role: "agent",
+          transcript: turn.reply,
+          stage: turn.next_stage,
+          intent: turn.intent,
+          objection_key: turn.objection_key || null,
+          objection_attempt: objectionAttempt,
+          latency_ms: latencyMs,
+        },
+      ]),
+      supabase.from("call_sessions").update(sessionUpdate).eq("id", sessionId),
+    ]);
+    if (turnsInsertError) {
+      return NextResponse.json({ error: turnsInsertError.message }, { status: 500 });
+    }
     if (sessionUpdateError) {
       return NextResponse.json({ error: sessionUpdateError.message }, { status: 500 });
     }

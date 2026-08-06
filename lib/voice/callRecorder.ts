@@ -1,64 +1,39 @@
-// Browser-only: mixes the mic input and every TTS playback into one MediaStream and records it
-// for the duration of the call, so the review page has audio for both sides of the conversation.
-export class CallRecorder {
-  private ctx: AudioContext;
-  private dest: MediaStreamAudioDestinationNode;
-  private recorder: MediaRecorder | null = null;
-  private chunks: Blob[] = [];
-  private micStream: MediaStream | null = null;
+// Browser-only. Owns the microphone for the length of the call and the tape the recording is
+// assembled from.
+//
+// Note what it no longer does: there is no always-on MediaRecorder and no AudioContext mixing
+// playback back into a capture graph. Nothing is being recorded between turns, so the silence
+// between them never exists in the first place — see CallTape for why.
+import { CallTape } from "./callTape";
+import { MonoAudio } from "./encodeWav";
 
-  constructor() {
-    this.ctx = new AudioContext();
-    this.dest = this.ctx.createMediaStreamDestination();
-  }
+export class CallRecorder {
+  private micStream: MediaStream | null = null;
+  private tape = new CallTape();
 
   async start() {
     this.micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const micSource = this.ctx.createMediaStreamSource(this.micStream);
-    micSource.connect(this.dest);
-
-    this.recorder = new MediaRecorder(this.dest.stream, { mimeType: "audio/webm" });
-    this.recorder.ondataavailable = (e) => {
-      if (e.data.size > 0) this.chunks.push(e.data);
-    };
-    this.recorder.start(1000);
   }
 
-  // Route a TTS playback element's audio into both the speakers and the recording mix.
-  routePlaybackElement(audioEl: HTMLAudioElement) {
-    const source = this.ctx.createMediaElementSource(audioEl);
-    source.connect(this.ctx.destination); // audible to the operator
-    source.connect(this.dest); // captured in the recording
-  }
-
+  // The push-to-talk MediaRecorder in the call page records off this stream directly.
   getMicStream() {
     return this.micStream;
   }
 
-  // Browsers start an AudioContext suspended unless it was created during a user gesture.
-  // Because TTS playback is routed through this context, a suspended context means the agent
-  // is inaudible — so resume it before every playback.
-  async ensureRunning() {
-    if (this.ctx.state === "suspended") {
-      try {
-        await this.ctx.resume();
-      } catch {
-        // Nothing more we can do here; the caller falls back to browser speech synthesis.
-      }
-    }
+  // Claim the next position on the tape. Call this the moment a turn begins — the audio can be
+  // handed over later, out of order, and still land where it belongs.
+  reserveSlot(): number {
+    return this.tape.reserve();
   }
 
-  async stop(): Promise<Blob> {
-    return new Promise((resolve) => {
-      if (!this.recorder) {
-        resolve(new Blob());
-        return;
-      }
-      this.recorder.onstop = () => {
-        resolve(new Blob(this.chunks, { type: "audio/webm" }));
-        this.micStream?.getTracks().forEach((t) => t.stop());
-      };
-      this.recorder.stop();
-    });
+  addClip(slot: number, clip: MonoAudio) {
+    this.tape.fill(slot, clip);
+  }
+
+  // Releases the mic and returns the stitched call, or null if nothing was ever captured.
+  finish(): Blob | null {
+    this.micStream?.getTracks().forEach((t) => t.stop());
+    this.micStream = null;
+    return this.tape.render();
   }
 }

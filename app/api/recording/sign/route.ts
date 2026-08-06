@@ -9,7 +9,9 @@ export async function POST(req: Request) {
     if (!sessionId) return NextResponse.json({ error: "sessionId required" }, { status: 400 });
 
     const supabase = createServiceClient();
-    const path = `${sessionId}/recording.webm`;
+    // WAV, not webm: the client now stitches the call from decoded PCM clips rather than
+    // draining a MediaRecorder, so what it uploads is a plain RIFF file.
+    const path = `${sessionId}/recording.wav`;
 
     const { data, error } = await supabase.storage.from("call-recordings").createSignedUploadUrl(path);
     if (error) return NextResponse.json({ error: error.message }, { status: 500 });
