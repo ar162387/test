@@ -95,10 +95,19 @@ export default function CallPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
-  // Fetches TTS audio and plays it. `onReady` fires right as playback starts (or immediately
-  // on failure) so the caller can reveal the matching transcript bubble in sync with the voice
-  // instead of showing text long before the audio catches up.
+  // Fetches TTS audio and plays it. `onReady` fires on the audio element's "playing" event —
+  // i.e. the instant sound actually reaches the speakers — so the transcript bubble appears in
+  // step with the voice rather than seconds ahead of it. If audio can't play at all we still
+  // fire it once, so a failed TTS never leaves a line missing from the transcript.
   async function playText(text: string, onReady: () => void) {
+    let revealed = false;
+    const revealOnce = () => {
+      if (!revealed) {
+        revealed = true;
+        onReady();
+      }
+    };
+
     try {
       const res = await fetch("/api/tts", {
         method: "POST",
@@ -107,19 +116,23 @@ export default function CallPage() {
       });
       const { ok, data } = await readJson(res);
       if (!ok) {
-        onReady();
+        revealOnce();
         return;
       }
+
       const audioEl = new Audio(`data:${data.mimeType};base64,${data.audioBase64}`);
       recorderRef.current?.routePlaybackElement(audioEl);
-      onReady();
+      audioEl.addEventListener("playing", revealOnce, { once: true });
+
       await audioEl.play();
       await new Promise((resolve) => {
         audioEl.onended = resolve;
+        audioEl.onerror = resolve;
       });
     } catch {
-      // Audio failed entirely — still reveal the text so the transcript isn't missing a line.
-      onReady();
+      // Autoplay blocked, decode error, network failure — show the text regardless.
+    } finally {
+      revealOnce();
     }
   }
 

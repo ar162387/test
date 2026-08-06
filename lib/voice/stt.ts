@@ -2,7 +2,9 @@
 // Kimi (Bedrock) is the conversation brain — Gemini here only turns audio into text.
 
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = process.env.GEMINI_STT_MODEL || "gemini-2.5-flash";
+// Use the rolling "latest" alias, not a pinned version: Google retires pinned models for new
+// API keys ("gemini-2.5-flash is no longer available to new users"), which silently breaks STT.
+const MODEL = process.env.GEMINI_STT_MODEL || "gemini-flash-latest";
 
 export async function transcribeAudio(audioBase64: string, mimeType: string): Promise<string> {
   if (!API_KEY) throw new Error("GEMINI_API_KEY is not set");
